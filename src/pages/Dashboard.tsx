@@ -1,12 +1,16 @@
 import { useMemo, useState, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Users, UserCheck, TrendingUp, BarChart3 } from "lucide-react";
+import { Users, UserCheck, TrendingUp, BarChart3, Award } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@core/integrations/supabase/client";
+import { useAuth } from "@core/contexts/AuthContext";
 import { format } from "date-fns";
 import { ptBR } from "date-fns/locale";
 import { PERFIL_ANIMAL_NAME } from "@testes/components/testes/TestePerfilResultado";
+import { BANDA_COLORS } from "@testes/utils/scoreCalculation";
+import SalarioVsMercadoChart from "@dashboard/components/dashboard/SalarioVsMercadoChart";
+import ScoreVsPercentilSalarialChart from "@dashboard/components/dashboard/ScoreVsPercentilSalarialChart";
 import {
   LineChart,
   Line,
@@ -19,6 +23,7 @@ import {
   Tooltip,
   ResponsiveContainer,
   Sector,
+  ReferenceLine,
 } from "recharts";
 
 const ANIMAL_DASHBOARD_CONFIG: Record<
@@ -97,16 +102,23 @@ const renderActiveShape = (props: any) => {
 
 const Dashboard = () => {
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const { hasRole } = useAuth();
+  const canSeeScoreKPI = hasRole("admin_geral") || hasRole("admin_ceo") || hasRole("admin_diretor");
+  const canSeeRuler = hasRole("admin_geral") || hasRole("admin_ceo");
 
   const { data: colaboradores = [], isLoading: loadingColabs } = useQuery({
     queryKey: ["dashboard_colaboradores"],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("pdi_colaboradores")
-        .select("id, cargo, funcao")
+        .select("id, cargo, cargo_rel:pdi_cargos(nome, tipo, nivel)" as any)
         .eq("ativo", true);
       if (error) throw error;
-      return data;
+      return data as unknown as {
+        id: string;
+        cargo: string | null;
+        cargo_rel: { nome: string; tipo: string; nivel: string } | null;
+      }[];
     },
   });
 
@@ -133,16 +145,35 @@ const Dashboard = () => {
     },
   });
 
+  const { data: scoresConsolidados = [], isLoading: loadingScores } = useQuery({
+    queryKey: ["dashboard_scores"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("pdi_score_consolidado" as any)
+        .select("colaborador_id, user_id, score_display, banda, created_at")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return data as unknown as {
+        colaborador_id: string | null;
+        user_id: string;
+        score_display: number;
+        banda: "Percentil 25°" | "Percentil 50°" | "Percentil 75°";
+        created_at: string;
+      }[];
+    },
+    enabled: canSeeScoreKPI,
+  });
+
   const isLoading = loadingColabs || loadingPlanos || loadingTestes;
 
   const totalColaboradores = colaboradores.length;
 
+  // Agora usamos cargo_rel.nivel (catálogo estruturado); fallback para string match em cargo legado
   const gerentes = useMemo(
     () =>
       colaboradores.filter((c) => {
-        const cargo = (c.cargo || "").toLowerCase();
-        const funcao = (c.funcao || "").toLowerCase();
-        return cargo.includes("gerente") || funcao.includes("gerente");
+        if (c.cargo_rel?.nivel === "Gerência") return true;
+        return (c.cargo || "").toLowerCase().includes("gerente");
       }).length,
     [colaboradores]
   );
@@ -150,9 +181,8 @@ const Dashboard = () => {
   const diretores = useMemo(
     () =>
       colaboradores.filter((c) => {
-        const cargo = (c.cargo || "").toLowerCase();
-        const funcao = (c.funcao || "").toLowerCase();
-        return cargo.includes("diretor") || funcao.includes("diretor");
+        if (c.cargo_rel?.nivel === "Diretoria") return true;
+        return (c.cargo || "").toLowerCase().includes("diretor");
       }).length,
     [colaboradores]
   );
@@ -216,11 +246,53 @@ const Dashboard = () => {
     setActiveIndex(null);
   }, []);
 
+  // Score agregations (apenas para admins)
+  const latestScores = useMemo(() => {
+    const acc: Record<string, typeof scoresConsolidados[number]> = {};
+    for (const s of scoresConsolidados) {
+      const key = s.colaborador_id ?? s.user_id;
+      if (!acc[key] || new Date(s.created_at) > new Date(acc[key].created_at)) acc[key] = s;
+    }
+    return Object.values(acc);
+  }, [scoresConsolidados]);
+
+  const avgScore = useMemo(() => {
+    if (latestScores.length === 0) return null;
+    return Math.round(latestScores.reduce((s, r) => s + r.score_display, 0) / latestScores.length);
+  }, [latestScores]);
+
+  const bandaCounts = useMemo(() => ({
+    "Percentil 25°": latestScores.filter((s) => s.banda === "Percentil 25°").length,
+    "Percentil 50°": latestScores.filter((s) => s.banda === "Percentil 50°").length,
+    "Percentil 75°": latestScores.filter((s) => s.banda === "Percentil 75°").length,
+  }), [latestScores]);
+
+  const scoreEvolutionData = useMemo(() => {
+    const months: Record<string, number[]> = {};
+    for (const s of scoresConsolidados) {
+      const m = format(new Date(s.created_at), "MMM/yy", { locale: ptBR });
+      months[m] = [...(months[m] ?? []), s.score_display];
+    }
+    return Object.entries(months)
+      .map(([mes, arr]) => ({
+        mes,
+        scoreMedio: Math.round(arr.reduce((a, b) => a + b, 0) / arr.length),
+      }))
+      .slice(-6);
+  }, [scoresConsolidados]);
+
   const kpis = [
     { title: "Total Colaboradores", value: String(totalColaboradores), icon: Users },
     { title: "Gerentes", value: String(gerentes), icon: UserCheck },
     { title: "Diretores", value: String(diretores), icon: BarChart3 },
     { title: "Evolução PDI", value: `${mediaPDI}%`, icon: TrendingUp },
+    ...(canSeeScoreKPI
+      ? [{
+          title: "Score Médio",
+          value: avgScore !== null ? String(avgScore) : "—",
+          icon: Award,
+        }]
+      : []),
   ];
 
   return (
@@ -233,7 +305,7 @@ const Dashboard = () => {
       </div>
 
       {/* KPIs */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 md:gap-4">
         {kpis.map((kpi) => (
           <Card key={kpi.title} className="hover:shadow-md transition-shadow">
             <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -299,6 +371,91 @@ const Dashboard = () => {
           )}
         </CardContent>
       </Card>
+
+      {/* ═════ NOVOS CARDS DO SCORE CONSOLIDADO ═════ */}
+
+      {/* Evolução do Score Blips */}
+      {canSeeScoreKPI && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="font-display text-lg">Evolução do Score Blips</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {loadingScores ? (
+              <Skeleton className="h-48 w-full" />
+            ) : scoreEvolutionData.length < 2 ? (
+              <p className="text-sm text-muted-foreground py-6 text-center">
+                Dados insuficientes — calcule scores em diferentes períodos (reteste semestral).
+              </p>
+            ) : (
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={scoreEvolutionData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                  <XAxis dataKey="mes" tick={{ fontSize: 12, fill: "hsl(var(--muted-foreground))" }} />
+                  <YAxis domain={[0, 100]} tick={{ fontSize: 12, fill: "hsl(var(--muted-foreground))" }} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "hsl(var(--background))",
+                      border: "1px solid hsl(var(--border))",
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                    formatter={(v: number) => [`${v}`, "Score Médio"]}
+                  />
+                  <ReferenceLine y={39} stroke="#f59e0b" strokeDasharray="4 4" />
+                  <ReferenceLine y={75} stroke="#10b981" strokeDasharray="4 4" />
+                  <Line
+                    type="monotone"
+                    dataKey="scoreMedio"
+                    stroke="hsl(var(--primary))"
+                    strokeWidth={2}
+                    dot={{ r: 4, fill: "hsl(var(--primary))" }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Régua de Distribuição Percentil (apenas admin_geral + admin_ceo) */}
+      {canSeeRuler && latestScores.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="font-display text-lg">Distribuição Percentil — Empresa</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex h-8 overflow-hidden rounded-full">
+              {(["Percentil 25°", "Percentil 50°", "Percentil 75°"] as const).map((b) => {
+                const hex = BANDA_COLORS[b].hex;
+                const pct = (bandaCounts[b] / latestScores.length) * 100;
+                return pct > 0 ? (
+                  <div
+                    key={b}
+                    style={{ width: `${pct}%`, background: hex }}
+                    className="flex items-center justify-center text-xs font-bold text-white"
+                    title={`${b}: ${bandaCounts[b]}`}
+                  >
+                    {pct >= 10 ? bandaCounts[b] : ""}
+                  </div>
+                ) : null;
+              })}
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-sm text-center">
+              {(["Percentil 25°", "Percentil 50°", "Percentil 75°"] as const).map((b) => (
+                <div key={b}>
+                  <p className="font-semibold">{bandaCounts[b]}</p>
+                  <p className="text-xs text-muted-foreground">{b}</p>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Gráficos salariais (apenas admin_geral + admin_ceo) */}
+      {canSeeRuler && <SalarioVsMercadoChart />}
+      {canSeeRuler && <ScoreVsPercentilSalarialChart />}
 
       {/* Distribuição de Perfis - full width */}
       <Card>
