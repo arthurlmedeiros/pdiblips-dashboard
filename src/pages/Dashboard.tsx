@@ -11,6 +11,7 @@ import { PERFIL_ANIMAL_NAME } from "@testes/components/testes/TestePerfilResulta
 import { BANDA_COLORS } from "@testes/utils/scoreCalculation";
 import SalarioVsMercadoChart from "@dashboard/components/dashboard/SalarioVsMercadoChart";
 import ScoreVsPercentilSalarialChart from "@dashboard/components/dashboard/ScoreVsPercentilSalarialChart";
+import SalarioVsScoreChart from "@dashboard/components/dashboard/SalarioVsScoreChart";
 import {
   LineChart,
   Line,
@@ -373,6 +374,9 @@ const Dashboard = () => {
       </Card>
 
       {/* ═════ NOVOS CARDS DO SCORE CONSOLIDADO ═════ */}
+
+      {/* Salário Pago × Score (dispersão por colaborador) */}
+      {canSeeRuler && <SalarioVsScoreChart />}
 
       {/* Evolução do Score Blips */}
       {canSeeScoreKPI && (
